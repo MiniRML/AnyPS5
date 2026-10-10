@@ -1,9 +1,14 @@
 #include "SceTypes.hpp"
+#include "prx/libkernel/Pthread/include/Pthread.hpp"
 #include <cstddef>
 #include <cstdlib>
+#include <cstdio>
+#include <limits>
 #include <future>
 
 extern "C" {
+int* APS5_VABI __error_nid_postfix();
+int APS5_VABI pthread_attr_setinheritsched_nid_postfix(PthreadAttr* attr, int inheritSched);
 int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, PthreadEntry entry, void* arg, const char* name);
 int APS5_VABI scePthreadJoin(Pthread thread, void** retval);
 int APS5_VABI scePthreadSetprio(Pthread thread, int prio);
@@ -76,6 +81,38 @@ static void CheckStackSizeLimit() {
     Require(scePthreadAttrDestroy(&attr) == SCE_OK);
 }
 
+static void CheckSchedulingInheritance() {
+    constexpr int InheritSched = 4;
+    constexpr int GuestEnotsup = 45;
+    constexpr int ErrnoSentinel = 123;
+    const int invalidModes[] = {std::numeric_limits<int>::min(), -1, 1, 2, 3, 5, std::numeric_limits<int>::max()};
+    PthreadAttr attr = nullptr;
+    int* const guestErrno = __error_nid_postfix();
+    const int previousErrno = *guestErrno;
+    Require(scePthreadAttrInit(&attr) == SCE_OK);
+    for (const int mode : {EXPLICIT_SCHED, InheritSched}) {
+        *guestErrno = ErrnoSentinel;
+        Require(pthread_attr_setinheritsched_nid_postfix(&attr, mode) == SCE_OK);
+        Require(attr->_inheritsched == mode && *guestErrno == ErrnoSentinel);
+        for (const int invalid : invalidModes) {
+            const int result = pthread_attr_setinheritsched_nid_postfix(&attr, invalid);
+            if (result != GuestEnotsup) {
+                std::fprintf(stderr, "pthread_attr_setinheritsched(%d): expected %d, got %d\n", invalid, GuestEnotsup, result);
+                std::abort();
+            }
+            Require(attr->_inheritsched == mode && *guestErrno == ErrnoSentinel);
+        }
+    }
+    Require(scePthreadAttrDestroy(&attr) == SCE_OK);
+    for (const int mode : {EXPLICIT_SCHED, InheritSched, 1, std::numeric_limits<int>::min(), std::numeric_limits<int>::max()}) {
+        *guestErrno = ErrnoSentinel;
+        Require(pthread_attr_setinheritsched_nid_postfix(nullptr, mode) == GUEST_EINVAL);
+        Require(pthread_attr_setinheritsched_nid_postfix(&attr, mode) == GUEST_EINVAL);
+        Require(attr == nullptr && *guestErrno == ErrnoSentinel);
+    }
+    *guestErrno = previousErrno;
+}
+
 static void* APS5_VABI Worker(void* arg) {
     static_cast<std::future<void>*>(arg)->get();
     return nullptr;
@@ -83,6 +120,7 @@ static void* APS5_VABI Worker(void* arg) {
 
 int main() {
     CheckStackSizeLimit();
+    CheckSchedulingInheritance();
     PthreadAttr attr = nullptr;
     Require(scePthreadAttrInit(&attr) == SCE_OK);
     Require(scePthreadAttrSetinheritsched(&attr, EXPLICIT_SCHED) == SCE_OK);

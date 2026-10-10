@@ -31,6 +31,7 @@ std::uint32_t TranslationContext::f32DenormalFlushFor(const RdnaInstruction& ins
     case RdnaOpcode::VSubrevF32:
     case RdnaOpcode::VMulF32:
     case RdnaOpcode::VMulLegacyF32:
+    case RdnaOpcode::VMullitF32:
     case RdnaOpcode::VMinF32:
     case RdnaOpcode::VMaxF32:
     case RdnaOpcode::VMin3F32:
@@ -86,6 +87,8 @@ std::uint32_t TranslationContext::f32DenormalFlushFor(const RdnaInstruction& ins
     case RdnaOpcode::VCvtPkrtzF16F32:
     case RdnaOpcode::VCvtF16F32:
     case RdnaOpcode::VDivFixupF32:
+    case RdnaOpcode::VMadMixloF16:
+    case RdnaOpcode::VMadMixhiF16:
         flush = 1u;
         break;
     case RdnaOpcode::VMadLegacyF32:

@@ -803,6 +803,24 @@ endforeach()
 
 target_include_directories(agc_driver_packed_unorm_color_target_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
 
+foreach(stage IN ITEMS vert frag)
+    set(agcProvokingShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/ProvokingVertex.${stage})
+    set(agcProvokingShaderSpv ${agcTestShaderGeneratedRoot}/ProvokingVertex_${stage}.spv)
+    set(agcProvokingShaderHeader ${agcTestShaderGeneratedRoot}/ProvokingVertex_${stage}_spv.h)
+    string(TOUPPER "PROVOKING_VERTEX_${stage}_SPV" agcProvokingShaderSymbol)
+    add_custom_command(
+        OUTPUT "${agcProvokingShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTestShaderGeneratedRoot}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcProvokingShaderSpv}" "${agcProvokingShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcProvokingShaderSpv} -DOUTPUT=${agcProvokingShaderHeader}
+        -DSYMBOL=${agcProvokingShaderSymbol} -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcProvokingShaderSource}" glslang-standalone
+        VERBATIM
+    )
+    target_sources(agc_driver_provoking_vertex_tests PRIVATE ${agcProvokingShaderHeader})
+endforeach()
+target_include_directories(agc_driver_provoking_vertex_tests PRIVATE ${agcTestShaderGeneratedRoot})
+
 target_include_directories(agc_driver_prepared_exports_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
 
 target_include_directories(agc_driver_prepared_publication_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
@@ -843,6 +861,7 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
+    set_tests_properties(agc_driver_provoking_vertex PROPERTIES TIMEOUT 30)
     set_tests_properties(agc_driver_flat_store PROPERTIES RUN_SERIAL TRUE)
     set_tests_properties(agc_driver_storage_cache_budget PROPERTIES TIMEOUT 30)
     add_test(NAME agc_driver_sampled_cache_budget_memory COMMAND agc_driver_sampled_cache_budget_tests memory)
@@ -891,12 +910,14 @@ if(BUILD_TESTING)
             endif()
         endforeach()
     endforeach()
-    foreach(preparedMode IN ITEMS indirect uncached debug debug_failure deferred)
+    foreach(preparedMode IN ITEMS indirect uncached debug debug_failure deferred deferred_undecodable)
         set(preparedTest "agc_driver_prepared_shaders_${preparedMode}")
         if(preparedMode STREQUAL "indirect")
             add_test(NAME ${preparedTest} COMMAND agc_driver_prepared_shaders_tests --indirect)
         elseif(preparedMode STREQUAL "deferred")
             add_test(NAME ${preparedTest} COMMAND agc_driver_prepared_shaders_tests --deferred)
+        elseif(preparedMode STREQUAL "deferred_undecodable")
+            add_test(NAME ${preparedTest} COMMAND agc_driver_prepared_shaders_tests --deferred-undecodable)
         elseif(preparedMode STREQUAL "debug_failure")
             add_test(NAME ${preparedTest} COMMAND agc_driver_prepared_shaders_tests --fail-before-registration)
             set_tests_properties(${preparedTest} PROPERTIES WILL_FAIL TRUE TIMEOUT 30)
@@ -913,6 +934,10 @@ if(BUILD_TESTING)
             set_tests_properties(${preparedTest} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
+    set_tests_properties(agc_driver_prepared_shaders
+        agc_driver_prepared_shaders_indirect agc_driver_prepared_shaders_uncached
+        agc_driver_prepared_shaders_debug agc_driver_prepared_shaders_debug_failure
+        PROPERTIES RESOURCE_LOCK shader_failure_capture)
 endif()
 
 option(AGC_BUILD_VISUAL_TEST "Enable the standalone AGC SPIR-V visual test" OFF)

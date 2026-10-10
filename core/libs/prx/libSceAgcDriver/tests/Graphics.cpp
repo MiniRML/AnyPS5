@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "SceShaders.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
@@ -802,6 +803,19 @@ void DepthStencilTests() {
     Require(state.depth && state.depth->address == 0x10000 && state.depth->stencilAddress == 0x20000 && state.depth->format == VK_FORMAT_D32_SFLOAT_S8_UINT && state.depth->clearStencil == 7, "depth surface decode changed");
     Require(state.renderExtent.width == 4 && state.renderExtent.height == 2, "render extent ignores the depth surface");
     Require(!state.depthTest && !state.depthWrite && state.stencilTest, "depth/stencil enables changed");
+    Require(state.depth->htileAddress == 0, "an HTILE surface without DB_HTILE_DATA_BASE decoded an HTILE address");
+    queue.context[0x005] = 0x300;
+    queue.context[0x01e] = 0x01;
+    log.clear();
+    AgcDriver::Graphics::RegisterReadLog() = &log;
+    state = AgcDriver::Graphics::DecodeState(queue);
+    AgcDriver::Graphics::RegisterReadLog() = nullptr;
+    for (const auto read : log) Require(AgcDriver::Graphics::DrawKeyCovers(read), "DrawKeyRegisters lacks an HTILE register the decoder reads: " + std::to_string(read.offset));
+    Require(state.depth->htileAddress == (0x30000ull | (1ull << 40u)), "the HTILE address was not decoded from DB_HTILE_DATA_BASE and its high byte");
+    queue.context[0x010] &= ~0x20000000u;
+    state = AgcDriver::Graphics::DecodeState(queue);
+    Require(state.depth->htileAddress == 0, "a surface without TILE_SURFACE_ENABLE decoded an HTILE address");
+    queue.context[0x010] |= 0x20000000u;
     const auto& front = state.stencilFront;
     Require(front.compareOp == VK_COMPARE_OP_ALWAYS && front.passOp == VK_STENCIL_OP_INCREMENT_AND_CLAMP && front.failOp == VK_STENCIL_OP_KEEP && front.reference == 1 && front.writeMask == 0xff, "stencil mask pass changed");
     Require(std::memcmp(&state.stencilBack, &front, sizeof(front)) == 0, "back faces without BACKFACE_ENABLE must use the front state");
@@ -827,7 +841,15 @@ void DepthStencilTests() {
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "stencil add/subtract");
     queue.context[0x10b] = 0;
     queue.context[0x000] = 1;
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "DB_RENDER_CONTROL");
+    queue.context[0x00b] = std::bit_cast<std::uint32_t>(0.25f);
+    state = AgcDriver::Graphics::DecodeState(queue);
+    Require(state.depth && state.depthTest && state.depthWrite && state.depthCompare == VK_COMPARE_OP_ALWAYS && !state.depthBoundsTest && !state.depthBias && state.viewport.minDepth == 0.25f && state.viewport.maxDepth == 0.25f, "a DEPTH_CLEAR_ENABLE draw does not store DB_DEPTH_CLEAR everywhere it covers");
+    Require(AgcDriver::Graphics::DrawRejection(queue, false).empty(), "precheck rejected a depth clear");
+    queue.context[0x002] = 0x01000000;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "writable depth plane");
+    Require(AgcDriver::Graphics::DrawRejection(queue, false).find("writable depth plane") != std::string::npos, "precheck accepted read-only depth clear");
+    queue.context[0x002] = 0;
+    queue.context[0x00b] = 0;
     queue.context[0x000] = 0x22;
     state = AgcDriver::Graphics::DecodeState(queue);
     const auto clears = [](const VkStencilOpState& face) {
@@ -868,7 +890,10 @@ void DepthStencilTests() {
     state = AgcDriver::Graphics::DecodeState(queue);
     Require(!state.depthWrite && clears(state.stencilFront), "read-only depth prevented stencil clear");
     queue.context[0x002] = 0;
-    for (const auto control : {1u, 4u, 8u}) {
+    queue.context[0x000] = 0x23;
+    state = AgcDriver::Graphics::DecodeState(queue);
+    Require(state.depthWrite && state.depthCompare == VK_COMPARE_OP_ALWAYS && clears(state.stencilFront), "a combined depth and stencil clear draw does not clear both planes");
+    for (const auto control : {4u, 8u}) {
         queue.context[0x000] = 0x22u | control;
         expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "DB_RENDER_CONTROL");
     }
@@ -907,6 +932,22 @@ void OneDimensionalColorTests() {
     queue.context[0x3b0] = 63u << 14u;
     const auto line = AgcDriver::Graphics::DecodeState(queue);
     Require(line.color.extent.width == 64u && line.color.extent.height == 1u && line.color.address == reinterpret_cast<std::uintptr_t>(colorMemory.data()) && line.color.depth == 1u, "a 1D color target did not decode as one row");
+}
+
+void htileDepthClearTests() {
+    static constexpr std::array<std::uint32_t, 17> kernel{0xd7460000u, 0x04010c06u, 0x34000084u, 0xdc388000u, 0x04020000u, 0xbf8c3f70u, 0xd7710008u, 0x00120805u, 0xd7710009u, 0x00120a05u, 0xd771000au, 0x00120c05u, 0xd771000bu, 0x00120e05u, 0xdc788000u, 0x00020800u, 0xbf810000u};
+    const std::array<std::uint32_t, 3> wave{64, 1, 1};
+    const auto address = [&](std::span<const std::uint32_t> code, std::array<std::uint32_t, 6> userData, std::array<std::uint32_t, 3> threads) {
+        return AgcDriver::Graphics::HtileDepthClearAddress(code, userData, threads);
+    };
+    Require(address(kernel, {0, 0, 0x0dc50000u, 0x40u, 0u, 0x00000ff0u}, wave) == 0x400dc50000ull, "RADV's HTILE depth fast clear (ZMASK to 0) was not recognized");
+    Require(address(kernel, {0, 0, 0x0dc50000u, 0x40u, 0xfffff00fu, 0x00000ff0u}, wave) == 0, "an HTILE initialization to expanded (ZMASK 0xf) was taken for a clear");
+    Require(address(kernel, {0, 0, 0x0dc50000u, 0x40u, 0x000003f0u, 0xfffffc0fu}, wave) == 0, "a stencil-only HTILE update that keeps ZMASK was taken for a depth clear");
+    Require(address(kernel, {0, 0, 0x0dc50000u, 0x40u, 0u, 0x00000ff0u}, {32, 1, 1}) == 0, "the HTILE kernel matched with another group size");
+    auto other = kernel;
+    other[6] ^= 1u;
+    Require(address(other, {0, 0, 0x0dc50000u, 0x40u, 0u, 0x00000ff0u}, wave) == 0, "a different kernel was taken for RADV's HTILE update");
+    Require(address(std::span(kernel).first(16), {0, 0, 0x0dc50000u, 0x40u, 0u, 0x00000ff0u}, wave) == 0, "a truncated kernel was taken for RADV's HTILE update");
 }
 
 void depthMaintenanceTests() {
@@ -1007,16 +1048,29 @@ void DepthBoundsBiasTests() {
     for (const auto offset : {0x2e1u, 0x2e3u}) queue.context[offset] = bits(4.0f);
     state = AgcDriver::Graphics::DecodeState(queue);
     Require(state.depthBias && state.depthBiasSlope == 2.0f && state.depthBiasConstant == 4.0f && state.depthBiasClamp == 0.5f, "depth bias decode changed");
+    Require(!state.depthBiasPerFace, "equal front and back depth bias must draw both faces in one pass");
+    queue.context[0x2e2] = bits(-64.0f);
     queue.context[0x2e3] = bits(8.0f);
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "differing between front and back");
+    state = AgcDriver::Graphics::DecodeState(queue);
+    Require(state.depthBias && state.depthBiasPerFace && state.cullMode == VK_CULL_MODE_NONE, "differing front and back depth bias must draw each face with its own bias");
+    Require(state.depthBiasSlope == 2.0f && state.depthBiasConstant == 4.0f && state.backDepthBiasSlope == -4.0f && state.backDepthBiasConstant == 8.0f && state.depthBiasClamp == 0.5f, "per-face depth bias decode changed");
+    queue.context[0x205] = 0x00000a48u;
+    state = AgcDriver::Graphics::DecodeState(queue);
+    Require(state.depthBias && state.depthBiasPerFace && state.depthBiasConstant == 4.0f && state.backDepthBiasSlope == 0.0f && state.backDepthBiasConstant == 0.0f, "back faces without depth bias must draw unbiased");
+    queue.context[0x205] = 0x00001248u;
+    state = AgcDriver::Graphics::DecodeState(queue);
+    Require(state.depthBias && state.depthBiasPerFace && state.depthBiasSlope == 0.0f && state.depthBiasConstant == 0.0f && state.backDepthBiasConstant == 8.0f, "front faces without depth bias must draw unbiased");
     queue.context[0x205] = 0x00001a4au;
     state = AgcDriver::Graphics::DecodeState(queue);
-    Require(state.depthBias && state.depthBiasConstant == 4.0f, "culled back faces must not constrain the front depth bias");
+    Require(state.depthBias && !state.depthBiasPerFace && state.depthBiasConstant == 4.0f, "culled back faces must not constrain the front depth bias");
+    queue.context[0x205] = 0x00001a49u;
+    state = AgcDriver::Graphics::DecodeState(queue);
+    Require(state.depthBias && !state.depthBiasPerFace && state.depthBiasSlope == -4.0f && state.depthBiasConstant == 8.0f, "culled front faces must draw with the back depth bias");
     queue.context[0x205] = 0x00003a46u;
     state = AgcDriver::Graphics::DecodeState(queue);
     Require(state.depthBias && state.depthBiasConstant == 4.0f && state.cullMode == VK_CULL_MODE_BACK_BIT, "a triangle draw with the point and line offset enable lost its depth bias");
     queue.userConfig[0x242] = 2;
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "polygon mode, depth bias, provoking vertex");
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "polygon mode, depth bias or nonstandard rasterization");
     queue.userConfig[0x242] = 4;
     queue.context[0x205] = 0x00001a4au;
     queue.context[0x2de] = 0x1f0u;
@@ -2765,6 +2819,128 @@ void orderedPixelShaderTests() {
     expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(orderedPixelRequest(0x30600u, plain))); }, "fragmentShaderPixelInterlock");
 }
 
+void ProvokingVertexTests() {
+    using namespace AgcDriver::Graphics;
+    constexpr std::uint32_t lastVertex = 1u << 19u;
+    auto queue = makeState();
+    queue.context[0x1b3] = 2;
+    queue.context[0x1b4] = 2;
+    const auto first = DecodeState(queue);
+    Require(first.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT, "the default provoking vertex is not first");
+    for (const auto primitive : {2u, 4u, 5u, 6u}) {
+        queue.userConfig[0x242] = primitive;
+        for (const auto last : {false, true, false}) {
+            queue.context[0x205] = 0x240u | (last ? lastVertex : 0u);
+            const auto state = DecodeState(queue);
+            Require(state.provokingVertexMode == (last ? VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT : VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT), "PROVOKING_VTX_LAST did not select the requested vertex for primitive " + std::to_string(primitive));
+            const auto rejection = DrawRejection(queue, false);
+            Require(rejection.empty(), "the draw precheck rejected provoking vertex mode for primitive " + std::to_string(primitive) + ": " + rejection);
+            Require(state.cullMode == first.cullMode && state.frontFace == first.frontFace && state.depthBias == first.depthBias, "PROVOKING_VTX_LAST changed another rasterization field");
+        }
+    }
+    queue.context[0x205] |= lastVertex;
+    queue.ClearContext();
+    Require((queue.context.at(0x205) & lastVertex) == 0, "context reset kept last provoking vertex mode");
+    Require(DrawKeyCovers({RegisterBank::Context, 0x205}), "the draw cache key does not cover provoking vertex mode");
+    const Context unsupported{};
+    ValidateProvokingVertex(unsupported, first);
+    auto last = first;
+    last.provokingVertexMode = VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
+    expectFailure([&] { ValidateProvokingVertex(unsupported, last); }, "last provoking vertex requires VK_EXT_provoking_vertex with provokingVertexLast enabled");
+    auto supported = unsupported;
+    supported.provokingVertexLast = true;
+    ValidateProvokingVertex(supported, last);
+    for (const auto topology : {VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN}) {
+        auto state = last;
+        state.topology = topology;
+        ValidateProvokingVertex(supported, state);
+    }
+    for (const auto topology : {VK_PRIMITIVE_TOPOLOGY_PATCH_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY, VK_PRIMITIVE_TOPOLOGY_MAX_ENUM}) {
+        auto state = last;
+        state.topology = topology;
+        expectFailure([&] { ValidateProvokingVertex(supported, state); }, "last provoking vertex is unsupported for this primitive topology");
+    }
+    const std::array<std::uint32_t, 7> flatColor{0xc8120002u, 0xc8160102u, 0xc81a0202u, 0xc81e0302u, 0xf800180fu, 0x07060504u, 0xbf810000u};
+    const auto flatPixel = recompilePixel({0x400u}, flatColor);
+    const auto inputs = locatedInputs(flatPixel.spirv.Words());
+    Require(inputs.size() == 1 && inputs[0].location == 0 && inputs[0].flat && !inputs[0].perVertex, "flat v_interp_mov P0 did not compile to a flat input");
+    Require(flatPixel.fragmentParameters.size() == 1 && flatPixel.fragmentParameters[0].flat && !flatPixel.fragmentParameters[0].perVertex, "flat v_interp_mov P0 has explicit per-vertex metadata");
+    const std::array<CompiledShader, 1> flatShaders{{{ShaderRecompiler::ShaderStage::Fragment, &flatPixel, 0}}};
+    ValidateProvokingVertex(supported, last, flatShaders);
+    ShaderRecompiler::RecompileResult fragment{};
+    const std::array<CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+    for (const auto topology : {VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN}) {
+        auto state = last;
+        state.topology = topology;
+        for (const auto flat : {false, true}) {
+            for (const auto perVertex : {false, true}) {
+                fragment.fragmentParameters = {{0, 0, flat, perVertex}};
+                auto firstState = state;
+                firstState.provokingVertexMode = VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT;
+                ValidateProvokingVertex(unsupported, firstState, shaders);
+                if (flat && perVertex) {
+                    expectFailure([&] { ValidateProvokingVertex(supported, state, shaders); }, "last provoking vertex with explicit per-vertex flat interpolation is unsupported");
+                } else if (perVertex && topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP) {
+                    expectFailure([&] { ValidateProvokingVertex(supported, state, shaders); }, "last provoking vertex with explicit per-vertex triangle-strip interpolation is unsupported");
+                } else {
+                    ValidateProvokingVertex(supported, state, shaders);
+                }
+            }
+        }
+    }
+    for (const auto path : {ShaderPath::Geometry, ShaderPath::Tessellation, ShaderPath::TessellationGeometry}) {
+        auto generated = last;
+        generated.stages.path = path;
+        expectFailure([&] { ValidateProvokingVertex(supported, generated); }, "last provoking vertex is unsupported for generated primitive pipelines");
+        generated.provokingVertexMode = VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT;
+        ValidateProvokingVertex(unsupported, generated);
+    }
+    for (std::uint32_t generated = 0; generated < 3; ++generated) {
+        auto state = last;
+        if (generated == 0) state.rectList = true;
+        if (generated == 1) state.stages.mesh.emplace();
+        if (generated == 2) state.stages.tessellation.emplace();
+        expectFailure([&] { ValidateProvokingVertex(supported, state); }, "last provoking vertex is unsupported for generated primitive pipelines");
+    }
+    last.provokingVertexMode = VK_PROVOKING_VERTEX_MODE_MAX_ENUM_EXT;
+    expectFailure([&] { ValidateProvokingVertex(supported, last); }, "invalid provoking vertex mode");
+}
+
+void ProvokingVertexRenderPassTests() {
+    using namespace AgcDriver::Graphics;
+    const auto first = DecodeState(makeState());
+    const std::array<VkImageView, 1> views{reinterpret_cast<VkImageView>(std::uintptr_t{1})};
+    const std::array<VkProvokingVertexModeEXT, 5> modes{
+        VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT, VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT,
+        VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT, VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT,
+        VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT
+    };
+    for (const bool perPipeline : {false, true}) {
+        Context context{};
+        context.provokingVertexLast = true;
+        context.provokingVertexModePerPipeline = perPipeline;
+        auto state = first;
+        const auto initialKey = DrawRenderPassKey(context, state, views);
+        auto previousKey = initialKey;
+        auto previousMode = modes.front();
+        for (const auto mode : modes) {
+            state.provokingVertexMode = mode;
+            const auto key = DrawRenderPassKey(context, state, views);
+            const bool reusable = key == previousKey;
+            Require(reusable == (perPipeline || mode == previousMode), "render-pass reuse does not respect provokingVertexModePerPipeline");
+            previousKey = key;
+            previousMode = mode;
+        }
+        Require(previousKey == initialKey, "returning to first provoking vertex changed the render-pass identity");
+        state.viewport.x += 1.0f;
+        Require(DrawRenderPassKey(context, state, views) == initialKey, "dynamic viewport changes prevent render-pass reuse");
+        const std::array<VkImageView, 1> differentViews{reinterpret_cast<VkImageView>(std::uintptr_t{2})};
+        Require(DrawRenderPassKey(context, state, differentViews) != initialKey, "different attachments share a render-pass identity");
+        ++state.renderExtent.width;
+        Require(DrawRenderPassKey(context, state, views) != initialKey, "different render extents share a render-pass identity");
+    }
+}
+
 void ConservativeRasterizationTests() {
     auto queue = makeState();
     queue.context[0x1b3] = 2;
@@ -3309,6 +3485,13 @@ void highestDrawIndexTests() {
     expectFailure([&] { HighestDrawIndex(bytesOf(narrow), 1, false); }, "unsupported index size");
 }
 
+void storeAtFlipTests() {
+    using AgcDriver::Graphics::StorageTexture;
+    Require(!StorageTexture::StoreAtFlipRequested(nullptr), "an unset APS5_STORE_AT_FLIP stored at each flip");
+    Require(StorageTexture::StoreAtFlipRequested("1"), "APS5_STORE_AT_FLIP=1 did not store at each flip");
+    for (const char* value : {"0", "", "true", "11"}) expectFailure([&] { StorageTexture::StoreAtFlipRequested(value); }, "expected 1");
+}
+
 void vertexCopyTests() {
     using AgcDriver::Graphics::PlanVertexCopies;
     using AgcDriver::Graphics::VertexFetch;
@@ -3398,11 +3581,14 @@ int main() {
         DepthClipTests();
         DepthStencilTests();
         OneDimensionalColorTests();
+        htileDepthClearTests();
         ZExportTests();
         unorm10_11_11TargetTests();
         DepthBoundsBiasTests();
         conservativeZExportTests();
         orderedPixelShaderTests();
+        ProvokingVertexTests();
+        ProvokingVertexRenderPassTests();
         ConservativeRasterizationTests();
         DisabledColorTests();
         OpaqueDestinationAlphaTests();
@@ -3431,6 +3617,7 @@ int main() {
         validationTests();
         vertexCopyTests();
         highestDrawIndexTests();
+        storeAtFlipTests();
         pixelParameterSlotTests();
         rectListTests();
         floatControlsModeTests();

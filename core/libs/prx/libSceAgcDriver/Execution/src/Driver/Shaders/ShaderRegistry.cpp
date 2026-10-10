@@ -20,6 +20,17 @@
 
 namespace AgcDriver::DriverDetail {
 
+std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnostics(const ShaderRecompiler::RecompileRequest& request, ShaderRecompiler::ShaderPreparationContext* preparation) {
+    try {
+        return ShaderRecompiler::PrepareShader(request, preparation);
+    } catch (...) {
+        try {
+            if (std::getenv("APS5_DUMP_SHADERS") != nullptr) static_cast<void>(Driver::dumpRequest(request.shader.codeAddress, request));
+        } catch (...) {}
+        throw;
+    }
+}
+
 std::shared_ptr<const ShaderSnapshot> ReadRawComputeShader(std::uint64_t address) {
     GuestMemory::CheckRange(reinterpret_cast<const void*>(address), sizeof(std::uint32_t), 256);
     static std::mutex cacheMutex;
@@ -181,7 +192,7 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const Shad
             if (snapshot.type != 0 || request.shader.stage != ShaderRecompiler::ShaderStage::Compute) throw std::runtime_error("AGC driver: unregistered program is not a compute shader");
             APS5_LOG_ERR("Compute shader 0x%llx was not registered; preparing its artifact at dispatch", static_cast<unsigned long long>(snapshot.codeAddress));
         }
-        auto handle = ShaderRecompiler::PrepareShader(request);
+        auto handle = PrepareShaderWithDiagnostics(request);
         snapshot.prepared->entries.push_back({codeOffset, handle});
         return handle;
     }
@@ -235,7 +246,7 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
             if (snapshot.type != 0 || request.shader.stage != ShaderRecompiler::ShaderStage::Compute) throw std::runtime_error("AGC driver: unregistered program is not a compute shader");
             APS5_LOG_ERR("Compute shader 0x%llx was not registered; preparing its artifact at dispatch", static_cast<unsigned long long>(snapshot.codeAddress));
         }
-        auto handle = ShaderRecompiler::PrepareShader(request);
+        auto handle = PrepareShaderWithDiagnostics(request);
         invocationRequest = request;
         invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*handle);
         auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, handle, key);
@@ -357,7 +368,13 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(const ShaderSnapshot& snap
     if (address < snapshot.codeAddress || address - snapshot.codeAddress >= snapshot.code.size() * 4u) throw std::runtime_error("AGC driver: registered entry point is outside shader code");
     const auto codeOffset = static_cast<std::size_t>((address - snapshot.codeAddress) / 4u);
     const auto code = std::span(snapshot.code).subspan(codeOffset);
-    const auto decoded = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(code);
+    ShaderRecompiler::RdnaProgram decoded;
+    try {
+        decoded = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(code);
+    } catch (const ShaderRecompiler::UnsupportedInstructionError& error) {
+        if (deferred == nullptr) throw;
+        return defer(error.what());
+    }
     std::optional<ShaderRecompiler::ShaderComputeStageInfo> compute;
     std::optional<ShaderRecompiler::ShaderPixelStageInfo> pixel;
     std::optional<ShaderRecompiler::ShaderVertexStageInfo> vertex;
@@ -409,7 +426,7 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(const ShaderSnapshot& snap
     ShaderRecompiler::ShaderPreparationContext preparation;
     const auto append = [&] {
         PerformanceTimer timing("Shader.PrepareArtifact");
-        entries.push_back({codeOffset, ShaderRecompiler::PrepareShader(request, &preparation)});
+        entries.push_back({codeOffset, PrepareShaderWithDiagnostics(request, &preparation)});
     };
     append();
     if (compute) {
@@ -468,7 +485,7 @@ std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decod
         }
         if (handle == nullptr) {
             PerformanceTimer timing("Shader.PrepareArtifact");
-            handle = ShaderRecompiler::PrepareShader(request);
+            handle = PrepareShaderWithDiagnostics(request);
         }
         const auto bytes = handle->artifact->bindings.pushConstantSizeBytes;
         require(bytes <= capacity - pushOffset, "prepared graphics stages exceed the push constant block");

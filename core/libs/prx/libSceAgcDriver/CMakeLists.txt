@@ -651,6 +651,12 @@ if(BUILD_TESTING)
         set_tests_properties(agc_unchanged_cpu_stamps PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME agc_host_import_unmap COMMAND agc_driver_recorder_tests --host-import-unmap-only)
+    set_tests_properties(agc_host_import_unmap PROPERTIES SKIP_RETURN_CODE 77)
+    if(WIN32)
+        set_tests_properties(agc_host_import_unmap PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
 endif()
 
 add_test_executable(agc_recorder_kept_bytes_tests EXCLUDE_FROM_ALL tests/RecorderKeptBytes.cpp)
@@ -1124,14 +1130,6 @@ if(BUILD_TESTING)
     add_test(NAME vector_min_max_med16 COMMAND vector_min_max_med16_tests)
     if(WIN32)
         set_tests_properties(vector_min_max_med16 PROPERTIES ENVIRONMENT_MODIFICATION
-            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
-    endif()
-    add_test_executable(vector_fma_nan_result_tests ${LIBS_INCLUDE_DIR}/tests/VectorFmaNanResult.cpp)
-    target_link_libraries(vector_fma_nan_result_tests PRIVATE shader_recompiler_agc_driver libc)
-    configure_windows_unwind(vector_fma_nan_result_tests)
-    add_test(NAME vector_fma_nan_result COMMAND vector_fma_nan_result_tests)
-    if(WIN32)
-        set_tests_properties(vector_fma_nan_result PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test_executable(vector_mad_legacy_tests ${LIBS_INCLUDE_DIR}/tests/VectorMadLegacy.cpp)

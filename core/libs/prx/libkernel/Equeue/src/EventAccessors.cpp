@@ -2,6 +2,8 @@
 #include <cstddef>
 #include <stdexcept>
 #include <string>
+#include "SceTypes.hpp"
+#include "prx/libc/include/General.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 
 static const KernelEvent& requireEvent(const KernelEvent* ev, const char* caller) {
